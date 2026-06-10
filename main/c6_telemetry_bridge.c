@@ -4,8 +4,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
-#include "secrets.h"
+#include "driver/uart.h"
 
+#include "secrets.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -16,9 +17,46 @@
 
 static const char *TAG = "C6_WIFI";
 
+//--------------------------------
+// UART settings
+// Future connection:
+// ESP32-S3 TX -> ESP32-C6 RX
+// ESP32-S3 RX -> ESP32-C6 TX
+// ESP32-S3 GND -> ESP32-C6 GND
+//--------------------------------
+#define TELEMETRY_UART_PORT UART_NUM_1
+#define TELEMETRY_UART_BAUD_RATE 115200
+
+// Verify that the UART pins are correct for your ESP32-C6 board before wiring
+// For now they are firmware placeholders.
+#define TELEMETRY_UART_TX_PIN 4
+#define TELEMETRY_UART_RX_PIN 5
+
+#define UART_RX_BUFFER_SIZE 1024
+#define UART_LINE_BUFFER_SIZE 256
+
+//--------------------------------
+// Shared telemetry state.
+// For now it starts with fake values, later it will be updated with real telemetry from the UART connection to the ESP32-S3.
+//--------------------------------  
+typedef struct {
+    bool armed;
+    char mode[16];
+    float vbat;
+    int counter;
+    int motors[4];
+} telemetry_state_t;
+
+static telemetry_state_t latest_telemetry = {
+    .armed = false,
+    .mode = "DISARMED",
+    .vbat = 12.60f,
+    .counter = 0,
+    .motors = {1000, 1000, 1000, 1000}
+};
+
 // Put your Wi-Fi details here locally.
 // Do not paste your real password into chat.
-
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -131,25 +169,31 @@ static void wifi_init_sta(void)
 
 static esp_err_t telemetry_get_handler(httpd_req_t *req)
 {
-    static int counter = 0;
-    float vbat = 12.60f - ((counter % 100) * 0.01f);
+    // For now, increment counter each time the browser requests telemetry.
+    // Later, the UART receive task will update this from real flight-controller data.
+    latest_telemetry.counter++;
+
     char response[256];
 
     snprintf(
         response,
         sizeof(response),
         "{"
-            "\"armed\":false,"
-            "\"mode\":\"DISARMED\","
+            "\"armed\":%s,"
+            "\"mode\":\"%s\","
             "\"vbat\":%.2f,"
             "\"counter\":%d,"
-            "\"motors\":[1000,1000,1000,1000]"
+            "\"motors\":[%d,%d,%d,%d]"
         "}",
-        vbat,
-        counter
+        latest_telemetry.armed ? "true" : "false",
+        latest_telemetry.mode,
+        latest_telemetry.vbat,
+        latest_telemetry.counter,
+        latest_telemetry.motors[0],
+        latest_telemetry.motors[1],
+        latest_telemetry.motors[2],
+        latest_telemetry.motors[3]
     );
-
-    counter++;
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
@@ -269,6 +313,100 @@ static void start_webserver(void)
   ESP_LOGI(TAG, "Telemetry endpoint: /telemetry");
 }
 
+static void telemetry_uart_task(void *arg)
+{
+    uint8_t rx_byte;
+    char line_buffer[UART_LINE_BUFFER_SIZE];
+    int line_pos = 0;
+
+    ESP_LOGI(TAG, "UART telemetry task started.");
+    ESP_LOGI(TAG, "Waiting for telemetry lines on UART%d at %d baud.",
+             TELEMETRY_UART_PORT, TELEMETRY_UART_BAUD_RATE);
+
+    while (1) {
+        int len = uart_read_bytes(
+            TELEMETRY_UART_PORT,
+            &rx_byte,
+            1,
+            pdMS_TO_TICKS(100)
+        );
+
+        if (len > 0) {
+            if (rx_byte == '\n') {
+                line_buffer[line_pos] = '\0';
+
+                ESP_LOGI(TAG, "UART line received: %s", line_buffer);
+
+                // Temporary parser:
+                // For now, every received line proves UART works.
+                // Later we parse JSON or compact binary telemetry here.
+                latest_telemetry.armed = true;
+                strncpy(latest_telemetry.mode, "UART", sizeof(latest_telemetry.mode));
+                latest_telemetry.vbat -= 0.01f;
+
+                if (latest_telemetry.vbat < 10.5f) {
+                    latest_telemetry.vbat = 12.60f;
+                }
+
+                latest_telemetry.motors[0] = 1100;
+                latest_telemetry.motors[1] = 1110;
+                latest_telemetry.motors[2] = 1120;
+                latest_telemetry.motors[3] = 1130;
+
+                line_pos = 0;
+            }
+            else if (rx_byte != '\r') {
+                if (line_pos < UART_LINE_BUFFER_SIZE - 1) {
+                    line_buffer[line_pos++] = (char)rx_byte;
+                } else {
+                    ESP_LOGW(TAG, "UART line too long. Dropping buffer.");
+                    line_pos = 0;
+                }
+            }
+        }
+    }
+}
+
+static void telemetry_uart_init(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = TELEMETRY_UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_LOGI(TAG, "Initializing telemetry UART%d...", TELEMETRY_UART_PORT);
+
+    ESP_ERROR_CHECK(uart_driver_install(
+        TELEMETRY_UART_PORT,
+        UART_RX_BUFFER_SIZE,
+        0,
+        0,
+        NULL,
+        0
+    ));
+
+    ESP_ERROR_CHECK(uart_param_config(
+        TELEMETRY_UART_PORT,
+        &uart_config
+    ));
+
+    ESP_ERROR_CHECK(uart_set_pin(
+        TELEMETRY_UART_PORT,
+        TELEMETRY_UART_TX_PIN,
+        TELEMETRY_UART_RX_PIN,
+        UART_PIN_NO_CHANGE,
+        UART_PIN_NO_CHANGE
+    ));
+
+    ESP_LOGI(TAG, "Telemetry UART initialized.");
+    ESP_LOGI(TAG, "UART TX pin: GPIO%d", TELEMETRY_UART_TX_PIN);
+    ESP_LOGI(TAG, "UART RX pin: GPIO%d", TELEMETRY_UART_RX_PIN);
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "C6 telemetry bridge Wi-Fi test starting...");
@@ -284,6 +422,17 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_result);
 
     wifi_init_sta();
+
+    telemetry_uart_init();
+
+    xTaskCreate(
+        telemetry_uart_task,
+        "telemetry_uart_task",
+        4096,
+        NULL,
+        5,
+        NULL
+    );
     
     start_webserver();
 
