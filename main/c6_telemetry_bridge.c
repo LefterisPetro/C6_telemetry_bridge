@@ -29,8 +29,8 @@ static const char *TAG = "C6_WIFI";
 
 // Verify that the UART pins are correct for your ESP32-C6 board before wiring
 // For now they are firmware placeholders.
-#define TELEMETRY_UART_TX_PIN 4
-#define TELEMETRY_UART_RX_PIN 5
+#define TELEMETRY_UART_TX_PIN 5
+#define TELEMETRY_UART_RX_PIN 4
 
 #define UART_RX_BUFFER_SIZE 1024
 #define UART_LINE_BUFFER_SIZE 256
@@ -171,7 +171,7 @@ static esp_err_t telemetry_get_handler(httpd_req_t *req)
 {
     // For now, increment counter each time the browser requests telemetry.
     // Later, the UART receive task will update this from real flight-controller data.
-    latest_telemetry.counter++;
+    //latest_telemetry.counter++; -> counter is now updated from UART data, so we don't increment it here anymore.
 
     char response[256];
 
@@ -337,21 +337,50 @@ static void telemetry_uart_task(void *arg)
 
                 ESP_LOGI(TAG, "UART line received: %s", line_buffer);
 
-                // Temporary parser:
-                // For now, every received line proves UART works.
-                // Later we parse JSON or compact binary telemetry here.
-                latest_telemetry.armed = true;
-                strncpy(latest_telemetry.mode, "UART", sizeof(latest_telemetry.mode));
-                latest_telemetry.vbat -= 0.01f;
+                // Simple controlled-format parser for H2 test telemetry.
+                // Expected example:
+                // {"source":"h2","armed":true,"mode":"UART_TEST","vbat":12.34,"counter":123}
+                char parsed_mode[16] = {0};
+                float parsed_vbat = 0.0f;
+                int parsed_counter = 0;
+                
+                bool parsed_armed = strstr(line_buffer, "\"armed\":true") != NULL;
+                
+                int parsed_fields = sscanf(
+                        line_buffer,
+                        "{\"source\":\"h2\",\"armed\":%*[^,],\"mode\":\"%15[^\"]\",\"vbat\":%f,\"counter\":%d}",
+                        parsed_mode,
+                        &parsed_vbat,
+                        &parsed_counter
+                    );
+                    
+                    if (parsed_fields == 3) {
+                        latest_telemetry.armed = parsed_armed;
+                        
+                        strncpy(
+                            latest_telemetry.mode,
+                            parsed_mode,
+                            sizeof(latest_telemetry.mode) - 1
+                        );
+                        latest_telemetry.mode[sizeof(latest_telemetry.mode) - 1] = '\0';
 
-                if (latest_telemetry.vbat < 10.5f) {
-                    latest_telemetry.vbat = 12.60f;
-                }
-
-                latest_telemetry.motors[0] = 1100;
-                latest_telemetry.motors[1] = 1110;
-                latest_telemetry.motors[2] = 1120;
-                latest_telemetry.motors[3] = 1130;
+                        latest_telemetry.vbat = parsed_vbat;
+                        latest_telemetry.counter = parsed_counter;
+                        
+                        // Still fake motor values for now.
+                        latest_telemetry.motors[0] = 1100;
+                        latest_telemetry.motors[1] = 1110;
+                        latest_telemetry.motors[2] = 1120;
+                        latest_telemetry.motors[3] = 1130;
+                        
+                        ESP_LOGI(TAG, "Parsed telemetry: armed=%d mode=%s vbat=%.2f counter=%d",
+                            latest_telemetry.armed,
+                            latest_telemetry.mode,
+                            latest_telemetry.vbat,
+                            latest_telemetry.counter);
+                    } else {
+                        ESP_LOGW(TAG, "Could not parse telemetry line: %s", line_buffer);
+                    }
 
                 line_pos = 0;
             }
