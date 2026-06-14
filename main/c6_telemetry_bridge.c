@@ -14,12 +14,13 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "esp_timer.h" // ESP-IDF high-resolution timer API for esp_timer_get_time()
 
 static const char *TAG = "C6_WIFI";
 
 //--------------------------------
 // UART settings
-// Future connection:
+// Wiring:
 // ESP32-S3 TX -> ESP32-C6 RX
 // ESP32-S3 RX -> ESP32-C6 TX
 // ESP32-S3 GND -> ESP32-C6 GND
@@ -40,19 +41,27 @@ static const char *TAG = "C6_WIFI";
 // For now it starts with fake values, later it will be updated with real telemetry from the UART connection to the ESP32-S3.
 //--------------------------------  
 typedef struct {
-    bool armed;
-    char mode[16];
-    float vbat;
-    int counter;
-    int motors[4];
+    bool armed;  // Indicates whether the flight controller is armed or disarmed. C6 telemetry must not make decision to arm or disarm the flight controller, it only reports the state.
+    char mode[16]; // Flight mode text received from the flight controller. (i.e. "DISARMED", "UART_TEST", "STABILIZE"). The buffer is intentionally small to avoid memory issues.
+    float vbat; // Battery voltage in volts received from the flight controller. For now it is a test value, later it will be updated from the FC power-monitoring.
+    int counter; //Monotonic counter that increments each time the telemetry is updated. Helps to verify that the telemetry is being updated and not stale.
+    int motors[4]; // Motor values received from the FC for display/debugging.
+    uint32_t last_packet_ms; //Timestamp of the last telemetry packet received from the FC. Unit: milliseconds since boot. Helps dashboard to detect stale telemetry.
+    uint32_t valid_packets; // Number of telemetry packets that were successfully parsed and considered valid. Helps to monitor telemetry reliability.
+    uint32_t invalid_packets; // Number of telemetry packets that were received but failed parsing or were considered invalid. Rising value may indicate protocol mismatch, baud-rate mismatch, or other communication issues.
 } telemetry_state_t;
 
 static telemetry_state_t latest_telemetry = {
-    .armed = false,
-    .mode = "DISARMED",
-    .vbat = 12.60f,
+    // Safe default state is disarmed.
+    .armed = false, 
+    .mode = "NO_LINK",
+    .vbat = 0.0f,
     .counter = 0,
-    .motors = {1000, 1000, 1000, 1000}
+    .motors = {0, 0, 0, 0},
+
+    .last_packet_ms = 0, // Zero means no packets received yet.
+    .valid_packets = 0, // Diagnostic counters start from zero on every boot.
+    .invalid_packets = 0
 };
 
 // Put your Wi-Fi details here locally.
@@ -169,21 +178,41 @@ static void wifi_init_sta(void)
 
 static esp_err_t telemetry_get_handler(httpd_req_t *req)
 {
-    // For now, increment counter each time the browser requests telemetry.
-    // Later, the UART receive task will update this from real flight-controller data.
-    //latest_telemetry.counter++; -> counter is now updated from UART data, so we don't increment it here anymore.
+    // Calculate telemetry link health. UART parser records latest_telemetry.last_packet_ms when a valid telemetry packet is received. 
+    // The HTTP API compares the current time with the last packet timestamp to determine if the telemetry link is healthy or stale or down.
+    // Display/diagnostic only, not used for any control decisions.
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL); // Get current time in milliseconds since boot.
+    uint32_t packet_age_ms = 0; // Age of the last telemetry packet in milliseconds. If no packets have been received yet, it will remain zero.
+    const char *link_status = "NO_LINK"; // Default status if no packets have been received yet.
+    const uint32_t telemetry_timeout_ms = 3000; // Timeout for considering telemetry link as down.
+
+    // If at least one telemetry packet has been received, calculate the age of the last packet.
+    if (latest_telemetry.last_packet_ms > 0) { 
+        packet_age_ms = now_ms - latest_telemetry.last_packet_ms;
+
+        if (packet_age_ms < telemetry_timeout_ms) {
+            link_status = "OK";
+        } else {
+            link_status = "STALE";
+        }
+    }
 
     char response[256];
-
+    
+    // Build the JSON response for the browser dashboard. It includes the latest telemetry state and the link health status.
     snprintf(
         response,
         sizeof(response),
         "{"
-            "\"armed\":%s,"
-            "\"mode\":\"%s\","
-            "\"vbat\":%.2f,"
-            "\"counter\":%d,"
-            "\"motors\":[%d,%d,%d,%d]"
+        "\"armed\":%s,"
+        "\"mode\":\"%s\","
+        "\"vbat\":%.2f,"
+        "\"counter\":%d,"
+        "\"motors\":[%d,%d,%d,%d],"
+        "\"link_status\":\"%s\","
+        "\"packet_age_ms\":%lu,"
+        "\"valid_packets\":%lu,"
+        "\"invalid_packets\":%lu"
         "}",
         latest_telemetry.armed ? "true" : "false",
         latest_telemetry.mode,
@@ -192,7 +221,11 @@ static esp_err_t telemetry_get_handler(httpd_req_t *req)
         latest_telemetry.motors[0],
         latest_telemetry.motors[1],
         latest_telemetry.motors[2],
-        latest_telemetry.motors[3]
+        latest_telemetry.motors[3],
+        link_status,
+        (unsigned long)packet_age_ms,
+        (unsigned long)latest_telemetry.valid_packets,
+        (unsigned long)latest_telemetry.invalid_packets
     );
 
     httpd_resp_set_type(req, "application/json");
@@ -355,31 +388,37 @@ static void telemetry_uart_task(void *arg)
                     );
                     
                     if (parsed_fields == 3) {
-                        latest_telemetry.armed = parsed_armed;
-                        
-                        strncpy(
+                        latest_telemetry.armed = parsed_armed; // Telemetry line was received and matched the expected format, so we update the latest telemetry state.
+                        //Copy the parsed mode into the latest telemetry state and avoid buffer overflow.
+                        strncpy( 
                             latest_telemetry.mode,
                             parsed_mode,
                             sizeof(latest_telemetry.mode) - 1
                         );
                         latest_telemetry.mode[sizeof(latest_telemetry.mode) - 1] = '\0';
-
-                        latest_telemetry.vbat = parsed_vbat;
-                        latest_telemetry.counter = parsed_counter;
-                        
-                        // Still fake motor values for now.
-                        latest_telemetry.motors[0] = 1100;
+                        latest_telemetry.vbat = parsed_vbat; //Store the parsed battery voltage into the latest telemetry state.
+                        latest_telemetry.counter = parsed_counter; //Store the parsed counter into the latest telemetry state.
+                        latest_telemetry.motors[0] = 1100; // For now, we use test values for motors. Later, these will be updated from real telemetry data from the FC.
                         latest_telemetry.motors[1] = 1110;
                         latest_telemetry.motors[2] = 1120;
                         latest_telemetry.motors[3] = 1130;
-                        
-                        ESP_LOGI(TAG, "Parsed telemetry: armed=%d mode=%s vbat=%.2f counter=%d",
+                        latest_telemetry.last_packet_ms = (uint32_t)(esp_timer_get_time() / 1000ULL); // Store the timestamp of the last telemetry packet received from the FC. esp_timer_get_time() returns time in microseconds, so we divide by 1000 to convert to milliseconds.
+                        latest_telemetry.valid_packets++; // Increment the count of valid telemetry packets received.
+
+                        ESP_LOGI(TAG,
+                            "Parsed telemetry: armed=%d mode=%s vbat=%.2f counter=%d valid=%lu",
                             latest_telemetry.armed,
                             latest_telemetry.mode,
                             latest_telemetry.vbat,
-                            latest_telemetry.counter);
+                            latest_telemetry.counter,
+                            (unsigned long)latest_telemetry.valid_packets);
                     } else {
-                        ESP_LOGW(TAG, "Could not parse telemetry line: %s", line_buffer);
+                        latest_telemetry.invalid_packets++; // Increment the count of invalid telemetry packets received.
+                        // Log a warning if the telemetry line could not be parsed correctly.
+                        ESP_LOGW(TAG,  
+                             "Could not parse telemetry line. invalid=%lu line=%s",
+                              (unsigned long)latest_telemetry.invalid_packets,
+                              line_buffer);
                     }
 
                 line_pos = 0;
