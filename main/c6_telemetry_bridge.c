@@ -250,6 +250,10 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         ".ok{color:#55ff88;}"
         ".bad{color:#ff5555;}"
         "pre{background:#000;padding:12px;border-radius:6px;overflow-x:auto;}"
+        ".link-ok{color:#1b8f3a;font-weight:bold;}"
+        ".link-stale{color:#c0392b;font-weight:bold;}"
+        ".link-no-link{color:#7f8c8d;font-weight:bold;}"
+        ".link-unknown{color:#d68910;font-weight:bold;}"
         "</style>"
         "</head>"
         "<body>"
@@ -275,24 +279,65 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<div id='counter' class='value'>--</div>"
         "</div>"
 
+        // Telemetry link health and diagnostics, JavaScript will update these values based on the latest telemetry received from the flight controller.  
+        "<p><strong>Link Status:</strong> "
+        "<span id=\"linkStatus\" class=\"link-unknown\">UNKNOWN</span></p>"
+
+        "<p><strong>Packet Age:</strong> "
+        "<span id=\"packetAge\">--</span> ms</p>"
+
+        "<p><strong>Valid Packets:</strong> "
+        "<span id=\"validPackets\">0</span></p>"
+
+        "<p><strong>Invalid Packets:</strong> "
+        "<span id=\"invalidPackets\">0</span></p>"
+
         "<div class='card'>"
         "<div class='label'>Raw JSON</div>"
         "<pre id='raw'>--</pre>"
         "</div>"
-
         "<script>"
         "async function updateTelemetry(){"
         "try{"
         "const r=await fetch('/telemetry');"
         "const d=await r.json();"
+        // Update the main aircraft status.
         "const s=document.getElementById('status');"
         "s.textContent=d.armed?'ARMED - '+d.mode:'DISARMED';"
         "s.className=d.armed?'value bad':'value ok';"
+        // Update the main telemetry values.
         "document.getElementById('vbat').textContent=d.vbat.toFixed(2)+' V';"
         "document.getElementById('motors').textContent=d.motors.join(', ');"
         "document.getElementById('counter').textContent=d.counter;"
+        // Display the telemetry link health info returned by the C6 API. The nullish coalescing operator (??) is used to handle cases where the telemetry API may not return a value yet.
+        "document.getElementById('packetAge').textContent=(d.packet_age_ms ?? '--');"
+        "document.getElementById('validPackets').textContent=(d.valid_packets ?? 0);"
+        "document.getElementById('invalidPackets').textContent=(d.invalid_packets ?? 0);"
+        // Update the link status with appropriate color coding based on the telemetry API response.
+        "const linkElement=document.getElementById('linkStatus');"
+        "linkElement.textContent=d.link_status ?? 'UNKNOWN';"
+
+        "switch(d.link_status){"
+        "case 'OK':"
+          "linkElement.className='link-ok';"
+          "break;"
+           
+        "case 'STALE':"
+          "linkElement.className='link-stale';"
+          "break;"
+
+        "case 'NO_LINK':"
+          "linkElement.className='link-no-link';"
+          "break;"
+
+        "default:"
+          "linkElement.className='link-unknown';"
+          "break;"
+        "}"
+        // Display the raw JSON telemetry data for debugging purposes. This allows developers to see the exact data structure being sent from the C6 telemetry bridge.
         "document.getElementById('raw').textContent=JSON.stringify(d,null,2);"
         "}catch(e){"
+        // If the HTTP request fails (e.g., due to network issues or the C6 telemetry bridge being down), display a connection error message in red.
         "document.getElementById('status').textContent='Connection error';"
         "document.getElementById('status').className='value bad';"
         "}"
