@@ -1,12 +1,16 @@
+// Standard C library headers.
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
+// FreeRTOS services used by the application.
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
 
-#include "secrets.h"
+// ESP-IDF peripheral and platform APIs.
+#include "driver/uart.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -14,8 +18,12 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
-#include "esp_timer.h" // ESP-IDF high-resolution timer API for esp_timer_get_time()
+#include "esp_timer.h"
 
+// Local project configuration.
+#include "secrets.h"
+
+// Logging tag shown at the beginning of this module's ESP-IDF log lines. It helps to identify which module generated the log message.
 static const char *TAG = "C6_WIFI";
 
 //--------------------------------
@@ -25,23 +33,26 @@ static const char *TAG = "C6_WIFI";
 // ESP32-S3 RX -> ESP32-C6 TX
 // ESP32-S3 GND -> ESP32-C6 GND
 //--------------------------------
+
+// The H2 is only a temp telemetry source used during development. The final telemetry source will be the flight controller (FC).
 #define TELEMETRY_UART_PORT UART_NUM_1
 #define TELEMETRY_UART_BAUD_RATE 115200
 
-// Verify that the UART pins are correct for your ESP32-C6 board before wiring
-// For now they are firmware placeholders.
+// Current ESP32-C6 UART pin allocation. GPIO4 receives telemetry from the sender, GPIO5 is reserved as the C6 telemetry TX output for future bidirectional communication.
 #define TELEMETRY_UART_TX_PIN 5
 #define TELEMETRY_UART_RX_PIN 4
 
+//UART driver receive buffer and application line-buffer sizes.
 #define UART_RX_BUFFER_SIZE 1024
 #define UART_LINE_BUFFER_SIZE 256
 
 //--------------------------------
 // Shared telemetry state.
-// For now it starts with fake values, later it will be updated with real telemetry from the UART connection to the ESP32-S3.
-//--------------------------------  
+//--------------------------------
+
+// Represents the most recently validated telemetry state.
 typedef struct {
-    bool armed;  // Indicates whether the flight controller is armed or disarmed. C6 telemetry must not make decision to arm or disarm the flight controller, it only reports the state.
+    bool armed;  // Indicates whether the flight controller is armed or disarmed.
     char mode[16]; // Flight mode text received from the flight controller. (i.e. "DISARMED", "UART_TEST", "STABILIZE"). The buffer is intentionally small to avoid memory issues.
     float vbat; // Battery voltage in volts received from the flight controller. For now it is a test value, later it will be updated from the FC power-monitoring.
     int counter; //Monotonic counter that increments each time the telemetry is updated. Helps to verify that the telemetry is being updated and not stale.
@@ -51,29 +62,62 @@ typedef struct {
     uint32_t invalid_packets; // Number of telemetry packets that were received but failed parsing or were considered invalid. Rising value may indicate protocol mismatch, baud-rate mismatch, or other communication issues.
 } telemetry_state_t;
 
+// Safe startup state before any valid telemetry packet arrives.
 static telemetry_state_t latest_telemetry = {
-    // Safe default state is disarmed.
     .armed = false, 
     .mode = "NO_LINK",
     .vbat = 0.0f,
     .counter = 0,
     .motors = {0, 0, 0, 0},
-
     .last_packet_ms = 0, // Zero means no packets received yet.
     .valid_packets = 0, // Diagnostic counters start from zero on every boot.
     .invalid_packets = 0
 };
 
-// Put your Wi-Fi details here locally.
-// Do not paste your real password into chat.
+//--------------------------------
+// Wi-Fi connection management
+// Put Wi-Fi details here locally.
+//--------------------------------
 
+// FreeRTOS event-group bits used to communicate Wi-Fi state.
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-static EventGroupHandle_t wifi_event_group;
-static int retry_count = 0;
-static const int max_retry_count = 10;
+// Delay between Wi-Fi reconnect attempt groups. esp_timer uses microseconds, therefore thhis value represents 5 seconds.
+#define WIFI_RECONNECT_DELAY_US (5ULL * 1000ULL * 1000ULL) 
 
+// Shared Wi-Fi synchronization object. NULL means it has not yet been created.
+static EventGroupHandle_t wifi_event_group = NULL;
+// Number of immediate reconnect attempts made in the current retry cycle.
+static int retry_count = 0;
+// Maximum number of immediate retries before scheduling a delayed retry.
+static const int max_retry_count = 10; 
+// One-shot ESP timer to delay the next Wi-Fi reconnect attempt to avoid blcking the ESP-IDF event handler task.
+static esp_timer_handle_t wifi_reconnect_timer = NULL;
+
+// Global HTTP server handle. Must be global because both the Wi-Fi event handler and the HTTP lifecycle functions need access to the same server instance.
+// NULL means that the HTTP server is currently stopped.
+static httpd_handle_t http_server = NULL;
+
+static void start_webserver(void);
+static void stop_webserver(void);
+
+// The callback starts a new connection attempt after the configured delay period.
+static void wifi_reconnect_timer_callback(void* arg){
+    //The callback argument is not used, but we include it to match the expected signature for esp_timer callbacks.
+    (void)arg;
+    retry_count = 0; // Reset the retry count for the new connection attempt cycle.
+
+    ESP_LOGI(TAG, "Wi-Fi reconnect delay expired. Starting a new retry cycle."); //esp_wifi_connect() starts one connection attempt. Whatever the outcome it is handled by the Wi-Fi event handler.
+    esp_err_t err = esp_wifi_connect();
+    
+    // Do not abort the application for a recoverable Wi-Fi connection failure. Record the error and continue.
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start delayed Wi-Fi connection attempt: %s", esp_err_to_name(err));
+    } 
+}
+
+//Handles asynchronous Wi-Fi and IP events generated by ESP-IDF. This function must remain short and non-blocking because it executes in the system event-loop context.
 static void wifi_event_handler(
     void *arg,
     esp_event_base_t event_base,
@@ -81,42 +125,165 @@ static void wifi_event_handler(
     void *event_data
 )
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    // The handler argument is not currently used.
+    (void)arg;
+
+    if (event_base == WIFI_EVENT &&
+        event_id == WIFI_EVENT_STA_START) {
+
         ESP_LOGI(TAG, "Wi-Fi station started. Connecting...");
-        esp_wifi_connect();
-    }
 
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    wifi_event_sta_disconnected_t *disconnected =
-        (wifi_event_sta_disconnected_t *) event_data;
-
-    ESP_LOGW(TAG, "Disconnected. Reason code: %d", disconnected->reason);
-
-    if (retry_count < max_retry_count) {
-        retry_count++;
-        ESP_LOGW(TAG, "Retrying %d/%d...", retry_count, max_retry_count);
-        esp_wifi_connect();
-    } else {
-        ESP_LOGE(TAG, "Failed to connect after maximum retries.");
-        xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
-      }
-    }
-
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+        // Clear old state before the first connection attempt.
+        xEventGroupClearBits(
+            wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT
+        );
 
         retry_count = 0;
 
-        ESP_LOGI(TAG, "Wi-Fi connected.");
-        ESP_LOGI(TAG, "IP address: " IPSTR, IP2STR(&event->ip_info.ip));
+        esp_err_t err = esp_wifi_connect();
 
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        if (err != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Failed to start initial Wi-Fi connection: %s",
+                esp_err_to_name(err)
+            );
+        }
+    }
+
+    else if (event_base == WIFI_EVENT &&
+             event_id == WIFI_EVENT_STA_DISCONNECTED) {
+
+        wifi_event_sta_disconnected_t *disconnected =
+            (wifi_event_sta_disconnected_t *)event_data;
+
+        // The station no longer has a usable Wi-Fi connection. Clear the connected bit immediately so application state does not continue to report a valid network connection.
+        xEventGroupClearBits(
+            wifi_event_group,
+            WIFI_CONNECTED_BIT
+        );
+
+        // Stop the HTTP server because all the active TCP sessions belong to the disconnected network interface and must no longer be considered valid. A fresh server instance will be created when the station regains a valid IP address.
+        stop_webserver();
+
+        ESP_LOGW(
+            TAG,
+            "Wi-Fi disconnected. Reason code: %d",
+            disconnected->reason
+        );
+
+        if (retry_count < max_retry_count) {
+            // Perform a limited number of immediate retries. These handle short interruptions without introducing an unnecessary five-second delay.
+            retry_count++;
+
+            ESP_LOGW(
+                TAG,
+                "Immediate Wi-Fi retry %d/%d...",
+                retry_count,
+                max_retry_count
+            );
+
+            esp_err_t err = esp_wifi_connect();
+
+            if (err != ESP_OK) {
+                ESP_LOGE(
+                    TAG,
+                    "Failed to start immediate Wi-Fi retry: %s",
+                    esp_err_to_name(err)
+                );
+            }
+        } else {
+            // The immediate retry group has been exhausted. WIFI_FAIL_BIT allows wifi_init_sta() to finish its initial blocking wait, while the background recovery system continues.
+            xEventGroupSetBits(
+                wifi_event_group,
+                WIFI_FAIL_BIT
+            );
+
+            ESP_LOGW(
+                TAG,
+                "Immediate retries exhausted. "
+                "Scheduling another retry cycle in 5 seconds."
+            );
+
+            // Avoid starting the one-shot timer more than once.
+            if (!esp_timer_is_active(wifi_reconnect_timer)) {
+                esp_err_t err = esp_timer_start_once(
+                    wifi_reconnect_timer,
+                    WIFI_RECONNECT_DELAY_US
+                );
+
+                if (err != ESP_OK) {
+                    ESP_LOGE(
+                        TAG,
+                        "Failed to schedule Wi-Fi reconnect timer: %s",
+                        esp_err_to_name(err)
+                    );
+                }
+            }
+        }
+    }
+
+    else if (event_base == IP_EVENT &&
+             event_id == IP_EVENT_STA_GOT_IP) {
+
+        ip_event_got_ip_t *event =
+            (ip_event_got_ip_t *)event_data;
+
+        // A valid IP address means the station is operational again.
+        retry_count = 0;
+
+        // Cancel any delayed reconnect that may still be pending.
+        if (esp_timer_is_active(wifi_reconnect_timer)) {
+            esp_timer_stop(wifi_reconnect_timer);
+        }
+
+        // Remove stale failure state and publish the connected state.
+        xEventGroupClearBits(
+            wifi_event_group,
+            WIFI_FAIL_BIT
+        );
+
+        xEventGroupSetBits(
+            wifi_event_group,
+            WIFI_CONNECTED_BIT
+        );
+
+        ESP_LOGI(TAG, "Wi-Fi connected.");
+        ESP_LOGI(
+            TAG,
+            "IP address: " IPSTR,
+            IP2STR(&event->ip_info.ip)
+        );
+
+        // Start or restore dashboard availability after the network recovery.
+        start_webserver();
     }
 }
 
 static void wifi_init_sta(void)
 {
     wifi_event_group = xEventGroupCreate();
+
+    // Validate that the FREERTOS event group was created successfully. Failure indicates a serious memory allocation issue that must be addressed before continuing.
+    if (wifi_event_group == NULL) {
+        ESP_LOGE(TAG, "Failed to create Wi-Fi event group.");
+        abort();
+    }
+
+    // Configure the one-shot timer used for the delayed Wi-Fi reconnection.
+    const esp_timer_create_args_t reconnect_timer_args = {
+        .callback = &wifi_reconnect_timer_callback, //Function to call when the timer expires.
+        .arg = NULL, //No argument is needed for this callback.
+        .name = "wifi_reconnect" //Name for debugging purposes.
+    };
+    
+    ESP_ERROR_CHECK(
+        esp_timer_create(
+            &reconnect_timer_args,
+            &wifi_reconnect_timer
+        )
+    );
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -354,41 +521,130 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Starts the embedded HTTP server and registers all dashboard endpoints. The function is idempotent: if the server is already running, it returns without creating a second HTTP server instance.
 static void start_webserver(void)
 {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-
-    httpd_handle_t server = NULL;
-
-    ESP_LOGI(TAG, "Starting HTTP server on port %d", config.server_port);
-
-    esp_err_t result = httpd_start(&server, &config);
-
-    if (result != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(result));
+    // Prevent duplicate server instances. Starting two servers on the same TCP port would fail and could also leave the application state inconsistent.
+    if (http_server != NULL) {
+        ESP_LOGW(TAG, "HTTP server is already running.");
         return;
     }
 
-    httpd_uri_t root_uri = {
-    .uri = "/",
-    .method = HTTP_GET,
-    .handler = root_get_handler,
-    .user_ctx = NULL
-  };
+    // Start from ESP-IDF's recommended default HTTP server configuration.
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
-    httpd_uri_t telemetry_uri = {
-    .uri = "/telemetry",
-    .method = HTTP_GET,
-    .handler = telemetry_get_handler,
-    .user_ctx = NULL
-  };
+    ESP_LOGI(
+        TAG,
+        "Starting HTTP server on port %d",
+        config.server_port
+    );
 
-  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root_uri));
-  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &telemetry_uri));
+    // Store the server handle in the global http_server variable. This allows the Wi-Fi event handler to stop the server later.
+    esp_err_t result = httpd_start(
+        &http_server,
+        &config
+    );
 
-  ESP_LOGI(TAG, "HTTP server started.");
-  ESP_LOGI(TAG, "Dashboard endpoint: /");
-  ESP_LOGI(TAG, "Telemetry endpoint: /telemetry");
+    if (result != ESP_OK) {
+        // Ensure the global state remains accurate after startup failure.
+        http_server = NULL;
+
+        ESP_LOGE(
+            TAG,
+            "Failed to start HTTP server: %s",
+            esp_err_to_name(result)
+        );
+
+        return;
+    }
+
+    // Dashboard root endpoint.
+    const httpd_uri_t root_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = root_get_handler,
+        .user_ctx = NULL
+    };
+
+    // Machine-readable telemetry endpoint.
+    const httpd_uri_t telemetry_uri = {
+        .uri = "/telemetry",
+        .method = HTTP_GET,
+        .handler = telemetry_get_handler,
+        .user_ctx = NULL
+    };
+
+    // Register the root dashboard endpoint. Do not use ESP_ERROR_CHECK here because registration failure is recoverable. We cleanly stop the partially configured server instead.
+    result = httpd_register_uri_handler(
+        http_server,
+        &root_uri
+    );
+
+    if (result != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to register dashboard endpoint: %s",
+            esp_err_to_name(result)
+        );
+
+        httpd_stop(http_server);
+        http_server = NULL;
+        return;
+    }
+
+    // Register the telemetry API endpoint.
+    result = httpd_register_uri_handler(
+        http_server,
+        &telemetry_uri
+    );
+
+    if (result != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to register telemetry endpoint: %s",
+            esp_err_to_name(result)
+        );
+
+        httpd_stop(http_server);
+        http_server = NULL;
+        return;
+    }
+
+    ESP_LOGI(TAG, "HTTP server started.");
+    ESP_LOGI(TAG, "Dashboard endpoint: /");
+    ESP_LOGI(TAG, "Telemetry endpoint: /telemetry");
+}
+
+// Stops the embedded HTTP server and closes all active HTTP connections. This function is safe to call even when the server is already stopped.
+static void stop_webserver(void)
+{
+    // No server is currently active.
+    if (http_server == NULL) {
+        ESP_LOGI(TAG, "HTTP server is already stopped.");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Stopping HTTP server...");
+
+    // httpd_stop() blocks until the HTTP server task terminates. It also closes open sessions and releases server resources.
+    esp_err_t result = httpd_stop(http_server);
+
+    if (result != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to stop HTTP server cleanly: %s",
+            esp_err_to_name(result)
+        );
+
+        // Even after an error, clear the handle so the application does not treat the old server instance as usable.
+        http_server = NULL;
+        return;
+    }
+
+    // Mark the server as stopped. A future IP_EVENT_STA_GOT_IP event may now start a fresh instance.
+    http_server = NULL;
+
+    ESP_LOGI(TAG, "HTTP server stopped.");
 }
 
 static void telemetry_uart_task(void *arg)
@@ -434,7 +690,7 @@ static void telemetry_uart_task(void *arg)
                     
                     if (parsed_fields == 3) {
                         latest_telemetry.armed = parsed_armed; // Telemetry line was received and matched the expected format, so we update the latest telemetry state.
-                        //Copy the parsed mode into the latest telemetry state and avoid buffer overflow.
+                        // Copy the parsed mode into the latest telemetry state and avoid buffer overflow.
                         strncpy( 
                             latest_telemetry.mode,
                             parsed_mode,
@@ -547,8 +803,6 @@ void app_main(void)
         NULL
     );
     
-    start_webserver();
-
     int counter = 0;
 
     while (1) {
