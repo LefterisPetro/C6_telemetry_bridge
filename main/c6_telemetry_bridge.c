@@ -20,6 +20,7 @@
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "mdns.h"
+#include "cJSON.h"
 
 // Local project configuration.
 #include "secrets.h"
@@ -48,6 +49,28 @@ static const char *TAG = "C6_WIFI";
 #define UART_LINE_BUFFER_SIZE 256
 
 //--------------------------------
+// Telemetry protocol contract.
+//--------------------------------
+
+// Version of the telemetry packet format currently accepted by the bridge.
+// Increment this value only when the packet structure changes in a way that is not backward-compatible.
+#define TELEMETRY_PROTOCOL_VERSION 1
+// Expected logical source identifier.
+// Prevents arbitrary JSON data received on UART from being treated as valid flight-controller telemetry.
+#define TELEMETRY_EXPECTED_SOURCE "flight_controller"
+// Maximum accepted mode-name length, excluding the terminating '\0'.
+// The telemetry_state_t buffer is 16 bytes, therefore the maximum safe payload length is 15 characters.
+#define TELEMETRY_MODE_MAX_LENGTH 15
+// Initial validation limits for battery voltage.
+// These are broad electrical sanity limits, not battery-warning thresholds. The final limits will later depend on the selected battery configuration.
+#define TELEMETRY_VBAT_MIN_VOLTS 0.0
+#define TELEMETRY_VBAT_MAX_VOLTS 60.0
+// Valid PWM-style motor-output range used during this development stage.
+//These limits will be revisited when the final ESC protocol is selected.
+#define TELEMETRY_MOTOR_MIN 800
+#define TELEMETRY_MOTOR_MAX 2200
+
+//--------------------------------
 // Shared telemetry state.
 //--------------------------------
 
@@ -56,12 +79,77 @@ typedef struct {
     bool armed;  // Indicates whether the flight controller is armed or disarmed.
     char mode[16]; // Flight mode text received from the flight controller. (i.e. "DISARMED", "UART_TEST", "STABILIZE"). The buffer is intentionally small to avoid memory issues.
     float vbat; // Battery voltage in volts received from the flight controller. For now it is a test value, later it will be updated from the FC power-monitoring.
-    int counter; //Monotonic counter that increments each time the telemetry is updated. Helps to verify that the telemetry is being updated and not stale.
+    uint32_t counter; // Monotonic counter that increments each time the telemetry is updated. Helps to verify that the telemetry is being updated and not stale.
     int motors[4]; // Motor values received from the FC for display/debugging.
-    uint32_t last_packet_ms; //Timestamp of the last telemetry packet received from the FC. Unit: milliseconds since boot. Helps dashboard to detect stale telemetry.
+    uint32_t last_packet_ms; // Timestamp of the last telemetry packet received from the FC. Unit: milliseconds since boot. Helps dashboard to detect stale telemetry.
     uint32_t valid_packets; // Number of telemetry packets that were successfully parsed and considered valid. Helps to monitor telemetry reliability.
     uint32_t invalid_packets; // Number of telemetry packets that were received but failed parsing or were considered invalid. Rising value may indicate protocol mismatch, baud-rate mismatch, or other communication issues.
 } telemetry_state_t;
+
+// Represents one completely parsed and validated telemetry packet.
+// This is intentionally separate from telemetry_state_t:
+//  telemetry_packet_t contains only data supplied by the sender.
+//  telemetry_state_t also contains local bridge diagnostics such as packet timestamps and valid/invalid packet counters.
+// The parser fills this temporary structure first. The shared dashboard state is updated only after the whole packet has passed validation.
+typedef struct {
+    // Telemetry protocol version declared by the sender.
+    uint32_t protocol_version;
+
+    // Monotonically increasing packet sequence number. This will later be used to detect duplicate, missing, or backwards packets.
+    uint32_t sequence;
+
+    // Armed state reported by the flight controller.
+    bool armed;
+
+    // Null-terminated flight-mode name. The array size allows up to TELEMETRY_MODE_MAX_LENGTH characters plus the required terminating null byte.
+    char mode[TELEMETRY_MODE_MAX_LENGTH + 1];
+
+    // Battery voltage reported by the flight controller, in volts.
+    float vbat;
+
+    // Motor outputs reported by the flight controller. These values are monitoring data only. The C6 does not generate or apply motor commands.
+    int motors[4];
+} telemetry_packet_t;
+
+// Describes the exact result of parsing and validating one UART line.
+// Keeping distinct error categories allows more useful logs, separate diagnostic counters later, easier protocol troubleshooting, clearer unit tests.
+typedef enum {
+    // Packet syntax, field types, and values are all valid.
+    TELEMETRY_PARSE_OK = 0,
+
+    // A null input pointer or output pointer was supplied.
+    TELEMETRY_PARSE_INVALID_ARGUMENT,
+
+    // Input was not syntactically valid JSON.
+    TELEMETRY_PARSE_JSON_SYNTAX_ERROR,
+
+    // The top-level JSON value was not an object.
+    TELEMETRY_PARSE_ROOT_NOT_OBJECT,
+
+    // One or more required fields were missing.
+    TELEMETRY_PARSE_MISSING_FIELD,
+
+    // A field existed but had the wrong JSON type. Example: "armed": "true" instead of "armed": true.
+    TELEMETRY_PARSE_WRONG_TYPE,
+
+    // protocol_version was not supported by this firmware.
+    TELEMETRY_PARSE_UNSUPPORTED_VERSION,
+
+    // source did not match TELEMETRY_EXPECTED_SOURCE.
+    TELEMETRY_PARSE_INVALID_SOURCE,
+
+    // sequence was negative, non-integral, or outside the supported range.
+    TELEMETRY_PARSE_INVALID_SEQUENCE,
+
+    // mode was empty, too long, or contained an invalid value.
+    TELEMETRY_PARSE_INVALID_MODE,
+
+    // Battery voltage was outside the broad sanity limits.
+    TELEMETRY_PARSE_INVALID_VBAT,
+
+    // motors was not a four-element array or contained invalid values.
+    TELEMETRY_PARSE_INVALID_MOTORS
+} telemetry_parse_result_t;
 
 // Safe startup state before any valid telemetry packet arrives.
 static telemetry_state_t latest_telemetry = {
@@ -112,6 +200,28 @@ static void start_webserver(void);
 static void stop_webserver(void);
 // Initialize the local mDNS hostname and advertises the HTTP service.
 static void start_mdns_service(void);
+
+// Parses and validates one complete JSON telemetry line.
+//--------------------------------
+// On success:
+// returns TELEMETRY_PARSE_OK,
+// writes the validated packet into output_packet.
+
+// On failure:
+// returns a specific telemetry_parse_result_t value,
+// does not modify the shared latest_telemetry state.
+//--------------------------------
+static telemetry_parse_result_t parse_telemetry_json(
+    const char *json_text,
+    telemetry_packet_t *output_packet
+);
+
+// Returns a readable diagnostic name for a parser result.
+//  This keeps logging code simple and avoids scattering switch statements throughout the UART task.
+static const char *telemetry_parse_result_to_string(
+    telemetry_parse_result_t result
+);
+
 
 // The callback starts a new connection attempt after the configured delay period.
 static void wifi_reconnect_timer_callback(void* arg){
@@ -477,7 +587,7 @@ static esp_err_t telemetry_get_handler(httpd_req_t *req)
         "\"armed\":%s,"
         "\"mode\":\"%s\","
         "\"vbat\":%.2f,"
-        "\"counter\":%d,"
+        "\"counter\":%lu,"
         "\"motors\":[%d,%d,%d,%d],"
         "\"link_status\":\"%s\","
         "\"packet_age_ms\":%lu,"
@@ -487,7 +597,7 @@ static esp_err_t telemetry_get_handler(httpd_req_t *req)
         latest_telemetry.armed ? "true" : "false",
         latest_telemetry.mode,
         latest_telemetry.vbat,
-        latest_telemetry.counter,
+        (unsigned long)latest_telemetry.counter,
         latest_telemetry.motors[0],
         latest_telemetry.motors[1],
         latest_telemetry.motors[2],
@@ -750,90 +860,441 @@ static void stop_webserver(void)
     ESP_LOGI(TAG, "HTTP server stopped.");
 }
 
+// Checks whether a flight-mode name follows the protocol naming rules.
+// Version 1 accepts: uppercase ASCII letters A-Z, digits 0-9, underscore, hyphen.
+// Examples: MANUAL, STABILIZE, ALT_HOLD, FAILSAFE-1
+static bool telemetry_mode_is_valid(const char *mode)
+{
+    if (mode == NULL) {
+        return false;
+    }
+
+    size_t length = strlen(mode);
+
+    // Reject empty names and strings that do not fit in the protocol buffer.
+    if (length == 0 || length > TELEMETRY_MODE_MAX_LENGTH) {
+        return false;
+    }
+
+    for (size_t index = 0; index < length; index++) {
+        char character = mode[index];
+
+        bool is_uppercase_letter =
+            character >= 'A' && character <= 'Z';
+
+        bool is_digit =
+            character >= '0' && character <= '9';
+
+        bool is_allowed_separator =
+            character == '_' || character == '-';
+
+        if (!is_uppercase_letter &&
+            !is_digit &&
+            !is_allowed_separator) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+//Converts parser-result values into stable diagnostic names.
+// Returning constant strings avoids dynamic memory allocation in logging.
+static const char *telemetry_parse_result_to_string(
+    telemetry_parse_result_t result
+)
+{
+    switch (result) {
+        case TELEMETRY_PARSE_OK:
+            return "OK";
+
+        case TELEMETRY_PARSE_INVALID_ARGUMENT:
+            return "INVALID_ARGUMENT";
+
+        case TELEMETRY_PARSE_JSON_SYNTAX_ERROR:
+            return "JSON_SYNTAX_ERROR";
+
+        case TELEMETRY_PARSE_ROOT_NOT_OBJECT:
+            return "ROOT_NOT_OBJECT";
+
+        case TELEMETRY_PARSE_MISSING_FIELD:
+            return "MISSING_FIELD";
+
+        case TELEMETRY_PARSE_WRONG_TYPE:
+            return "WRONG_TYPE";
+
+        case TELEMETRY_PARSE_UNSUPPORTED_VERSION:
+            return "UNSUPPORTED_VERSION";
+
+        case TELEMETRY_PARSE_INVALID_SOURCE:
+            return "INVALID_SOURCE";
+
+        case TELEMETRY_PARSE_INVALID_SEQUENCE:
+            return "INVALID_SEQUENCE";
+
+        case TELEMETRY_PARSE_INVALID_MODE:
+            return "INVALID_MODE";
+
+        case TELEMETRY_PARSE_INVALID_VBAT:
+            return "INVALID_VBAT";
+
+        case TELEMETRY_PARSE_INVALID_MOTORS:
+            return "INVALID_MOTORS";
+
+        default:
+            return "UNKNOWN_PARSE_RESULT";
+    }
+}
+
+
+// Parses and validates one JSON telemetry packet.
+/* Expected protocol-version-1 packet:
+   {
+ *   "protocol_version": 1,
+ *   "source": "flight_controller",
+ *   "sequence": 1234,
+ *   "armed": true,
+ *   "mode": "STABILIZE",
+ *   "vbat": 15.82,
+ *   "motors": [1100, 1110, 1120, 1130]
+ * }
+*/
+// Design rule: The output structure is modified only after every field has passed validation. A partially valid packet can therefore never partially overwrite the shared dashboard state.
+static telemetry_parse_result_t parse_telemetry_json(
+    const char *json_text,
+    telemetry_packet_t *output_packet
+)
+{
+    if (json_text == NULL || output_packet == NULL) {
+        return TELEMETRY_PARSE_INVALID_ARGUMENT;
+    }
+
+    // Require the complete input string to contain exactly one JSON value. This rejects trailing non-whitespace data after the JSON object.
+    const char *parse_end = NULL;
+
+    cJSON *root = cJSON_ParseWithOpts(
+        json_text,
+        &parse_end,
+        true
+    );
+
+    if (root == NULL) {
+        return TELEMETRY_PARSE_JSON_SYNTAX_ERROR;
+    }
+
+    telemetry_parse_result_t result = TELEMETRY_PARSE_OK;
+
+    // Parse into a temporary local structure. output_packet remains unchanged if any later validation fails.
+    telemetry_packet_t parsed_packet = {0};
+
+    if (!cJSON_IsObject(root)) {
+        result = TELEMETRY_PARSE_ROOT_NOT_OBJECT;
+        goto cleanup;
+    }
+
+    // Retrieve every required protocol field by its exact case-sensitive name.
+    const cJSON *protocol_version_item =
+        cJSON_GetObjectItemCaseSensitive(root, "protocol_version");
+
+    const cJSON *source_item =
+        cJSON_GetObjectItemCaseSensitive(root, "source");
+
+    const cJSON *sequence_item =
+        cJSON_GetObjectItemCaseSensitive(root, "sequence");
+
+    const cJSON *armed_item =
+        cJSON_GetObjectItemCaseSensitive(root, "armed");
+
+    const cJSON *mode_item =
+        cJSON_GetObjectItemCaseSensitive(root, "mode");
+
+    const cJSON *vbat_item =
+        cJSON_GetObjectItemCaseSensitive(root, "vbat");
+
+    const cJSON *motors_item =
+        cJSON_GetObjectItemCaseSensitive(root, "motors");
+
+    // Every field in protocol version 1 is mandatory.
+    if (protocol_version_item == NULL ||
+        source_item == NULL ||
+        sequence_item == NULL ||
+        armed_item == NULL ||
+        mode_item == NULL ||
+        vbat_item == NULL ||
+        motors_item == NULL) {
+        result = TELEMETRY_PARSE_MISSING_FIELD;
+        goto cleanup;
+    }
+
+    // Validate JSON types before reading values. JSON booleans must be actual true/false values, not strings or numbers.
+    if (!cJSON_IsNumber(protocol_version_item) ||
+        !cJSON_IsString(source_item) ||
+        !cJSON_IsNumber(sequence_item) ||
+        !cJSON_IsBool(armed_item) ||
+        !cJSON_IsString(mode_item) ||
+        !cJSON_IsNumber(vbat_item) ||
+        !cJSON_IsArray(motors_item)) {
+        result = TELEMETRY_PARSE_WRONG_TYPE;
+        goto cleanup;
+    }
+
+    // Protocol version must be an exact integer equal to the supported version.
+    double protocol_version_value =
+        protocol_version_item->valuedouble;
+
+    if (protocol_version_value < 0.0 ||
+        protocol_version_value > (double)UINT32_MAX ||
+        (double)(uint32_t)protocol_version_value != protocol_version_value ||
+        (uint32_t)protocol_version_value != TELEMETRY_PROTOCOL_VERSION) {
+        result = TELEMETRY_PARSE_UNSUPPORTED_VERSION;
+        goto cleanup;
+    }
+
+    // Source must identify the sender as the flight controller. The H2 test board will later send this source name while emulating the real flight controller.
+    if (source_item->valuestring == NULL ||
+        strcmp(
+            source_item->valuestring,
+            TELEMETRY_EXPECTED_SOURCE
+        ) != 0) {
+        result = TELEMETRY_PARSE_INVALID_SOURCE;
+        goto cleanup;
+    }
+
+    // Sequence must be a non-negative uint32 integer. Duplicate and backwards-sequence detection will be applied in the packet-acceptance layer after parsing.
+    double sequence_value = sequence_item->valuedouble;
+
+    if (sequence_value < 0.0 ||
+        sequence_value > (double)UINT32_MAX ||
+        (double)(uint32_t)sequence_value != sequence_value) {
+        result = TELEMETRY_PARSE_INVALID_SEQUENCE;
+        goto cleanup;
+    }
+
+    // Validate mode length and allowed characters before copying it.
+    if (mode_item->valuestring == NULL ||
+        !telemetry_mode_is_valid(mode_item->valuestring)) {
+        result = TELEMETRY_PARSE_INVALID_MODE;
+        goto cleanup;
+    }
+
+    //Battery voltage is validated against broad electrical sanity limits. These are not low-battery or critical-battery thresholds.
+    double vbat_value = vbat_item->valuedouble;
+
+    if (vbat_value < TELEMETRY_VBAT_MIN_VOLTS ||
+        vbat_value > TELEMETRY_VBAT_MAX_VOLTS) {
+        result = TELEMETRY_PARSE_INVALID_VBAT;
+        goto cleanup;
+    }
+
+    // Exactly four motor values are required for the current quadcopter telemetry protocol.
+    if (cJSON_GetArraySize(motors_item) != 4) {
+        result = TELEMETRY_PARSE_INVALID_MOTORS;
+        goto cleanup;
+    }
+
+    for (int motor_index = 0; motor_index < 4; motor_index++) {
+        const cJSON *motor_item =
+            cJSON_GetArrayItem(motors_item, motor_index);
+
+        if (!cJSON_IsNumber(motor_item)) {
+            result = TELEMETRY_PARSE_INVALID_MOTORS;
+            goto cleanup;
+        }
+
+        double motor_value = motor_item->valuedouble;
+
+        // Motor output must be an integer inside the configured monitoring range. Fractional PWM-style values are rejected.
+        if (motor_value < TELEMETRY_MOTOR_MIN ||
+            motor_value > TELEMETRY_MOTOR_MAX ||
+            (double)(int)motor_value != motor_value) {
+            result = TELEMETRY_PARSE_INVALID_MOTORS;
+            goto cleanup;
+        }
+
+        parsed_packet.motors[motor_index] = (int)motor_value;
+    }
+
+    // All validations succeeded. Populate the temporary packet.
+    parsed_packet.protocol_version =
+        (uint32_t)protocol_version_value;
+
+    parsed_packet.sequence =
+        (uint32_t)sequence_value;
+
+    parsed_packet.armed =
+        cJSON_IsTrue(armed_item);
+
+    strncpy(
+        parsed_packet.mode,
+        mode_item->valuestring,
+        sizeof(parsed_packet.mode) - 1
+    );
+
+    parsed_packet.mode[sizeof(parsed_packet.mode) - 1] = '\0';
+
+    parsed_packet.vbat =
+        (float)vbat_value;
+
+    // Commit the complete validated packet to the caller.
+    *output_packet = parsed_packet;
+
+cleanup:
+    // cJSON owns the complete parse tree. Deleting the root releases every child node allocated during parsing.
+    cJSON_Delete(root);
+
+    return result;
+}
+
+// Receives newline-delimited telemetry packets from UART. Each complete line is parsed and validated as one protocol packet. Invalid input never modifies the last known valid telemetry state.
 static void telemetry_uart_task(void *arg)
 {
-    uint8_t rx_byte;
-    char line_buffer[UART_LINE_BUFFER_SIZE];
-    int line_pos = 0;
+    // This task currently receives no startup argument.
+    (void)arg;
+
+    uint8_t rx_byte = 0;
+
+    // Buffer for one complete newline-terminated telemetry packet.
+    char line_buffer[UART_LINE_BUFFER_SIZE] = {0};
+
+    size_t line_pos = 0;
 
     ESP_LOGI(TAG, "UART telemetry task started.");
-    ESP_LOGI(TAG, "Waiting for telemetry lines on UART%d at %d baud.",
-             TELEMETRY_UART_PORT, TELEMETRY_UART_BAUD_RATE);
+
+    ESP_LOGI(
+        TAG,
+        "Waiting for telemetry lines on UART%d at %d baud.",
+        TELEMETRY_UART_PORT,
+        TELEMETRY_UART_BAUD_RATE
+    );
 
     while (1) {
-        int len = uart_read_bytes(
+        // Read one byte at a time so newline framing can be processed deterministically.
+        int bytes_read = uart_read_bytes(
             TELEMETRY_UART_PORT,
             &rx_byte,
             1,
             pdMS_TO_TICKS(100)
         );
 
-        if (len > 0) {
-            if (rx_byte == '\n') {
-                line_buffer[line_pos] = '\0';
+        if (bytes_read <= 0) {
+            continue;
+        }
 
-                ESP_LOGI(TAG, "UART line received: %s", line_buffer);
+        if (rx_byte == '\n') {
+            // Ignore empty lines.
+            if (line_pos == 0) {
+                continue;
+            }
 
-                // Simple controlled-format parser for H2 test telemetry.
-                // Expected example:
-                // {"source":"h2","armed":true,"mode":"UART_TEST","vbat":12.34,"counter":123}
-                char parsed_mode[16] = {0};
-                float parsed_vbat = 0.0f;
-                int parsed_counter = 0;
-                
-                bool parsed_armed = strstr(line_buffer, "\"armed\":true") != NULL;
-                
-                int parsed_fields = sscanf(
-                        line_buffer,
-                        "{\"source\":\"h2\",\"armed\":%*[^,],\"mode\":\"%15[^\"]\",\"vbat\":%f,\"counter\":%d}",
-                        parsed_mode,
-                        &parsed_vbat,
-                        &parsed_counter
+            // Terminate the accumulated byte sequence as a C string.
+            line_buffer[line_pos] = '\0';
+
+            ESP_LOGI(
+                TAG,
+                "UART line received: %s",
+                line_buffer
+            );
+
+            telemetry_packet_t parsed_packet = {0};
+
+            telemetry_parse_result_t parse_result =
+                parse_telemetry_json(
+                    line_buffer,
+                    &parsed_packet
+                );
+
+            if (parse_result == TELEMETRY_PARSE_OK) {
+                // The complete packet passed syntax, type, and value validation. It is now safe to update shared state.
+                latest_telemetry.armed =
+                    parsed_packet.armed;
+
+                strncpy(
+                    latest_telemetry.mode,
+                    parsed_packet.mode,
+                    sizeof(latest_telemetry.mode) - 1
+                );
+
+                latest_telemetry.mode[
+                    sizeof(latest_telemetry.mode) - 1
+                ] = '\0';
+
+                latest_telemetry.vbat =
+                    parsed_packet.vbat;
+
+                // Store the protocol sequence in the legacy counter field. This preserves the current HTTP/dashboard interface while the protocol migrates from counter to sequence terminology.
+                latest_telemetry.counter =
+                    parsed_packet.sequence;
+
+                for (int motor_index = 0;
+                     motor_index < 4;
+                     motor_index++) {
+                    latest_telemetry.motors[motor_index] =
+                        parsed_packet.motors[motor_index];
+                }
+
+                // Update freshness only after the entire packet is accepted.
+                latest_telemetry.last_packet_ms =
+                    (uint32_t)(
+                        esp_timer_get_time() / 1000ULL
                     );
-                    
-                    if (parsed_fields == 3) {
-                        latest_telemetry.armed = parsed_armed; // Telemetry line was received and matched the expected format, so we update the latest telemetry state.
-                        // Copy the parsed mode into the latest telemetry state and avoid buffer overflow.
-                        strncpy( 
-                            latest_telemetry.mode,
-                            parsed_mode,
-                            sizeof(latest_telemetry.mode) - 1
-                        );
-                        latest_telemetry.mode[sizeof(latest_telemetry.mode) - 1] = '\0';
-                        latest_telemetry.vbat = parsed_vbat; //Store the parsed battery voltage into the latest telemetry state.
-                        latest_telemetry.counter = parsed_counter; //Store the parsed counter into the latest telemetry state.
-                        latest_telemetry.motors[0] = 1100; // For now, we use test values for motors. Later, these will be updated from real telemetry data from the FC.
-                        latest_telemetry.motors[1] = 1110;
-                        latest_telemetry.motors[2] = 1120;
-                        latest_telemetry.motors[3] = 1130;
-                        latest_telemetry.last_packet_ms = (uint32_t)(esp_timer_get_time() / 1000ULL); // Store the timestamp of the last telemetry packet received from the FC. esp_timer_get_time() returns time in microseconds, so we divide by 1000 to convert to milliseconds.
-                        latest_telemetry.valid_packets++; // Increment the count of valid telemetry packets received.
 
-                        ESP_LOGI(TAG,
-                            "Parsed telemetry: armed=%d mode=%s vbat=%.2f counter=%d valid=%lu",
-                            latest_telemetry.armed,
-                            latest_telemetry.mode,
-                            latest_telemetry.vbat,
-                            latest_telemetry.counter,
-                            (unsigned long)latest_telemetry.valid_packets);
-                    } else {
-                        latest_telemetry.invalid_packets++; // Increment the count of invalid telemetry packets received.
-                        // Log a warning if the telemetry line could not be parsed correctly.
-                        ESP_LOGW(TAG,  
-                             "Could not parse telemetry line. invalid=%lu line=%s",
-                              (unsigned long)latest_telemetry.invalid_packets,
-                              line_buffer);
-                    }
+                latest_telemetry.valid_packets++;
+
+                ESP_LOGI(
+                    TAG,
+                    "Accepted telemetry: "
+                    "version=%lu sequence=%lu armed=%d "
+                    "mode=%s vbat=%.2f valid=%lu",
+                    (unsigned long)parsed_packet.protocol_version,
+                    (unsigned long)parsed_packet.sequence,
+                    parsed_packet.armed,
+                    parsed_packet.mode,
+                    parsed_packet.vbat,
+                    (unsigned long)latest_telemetry.valid_packets
+                );
+            } else {
+                // The line was complete but did not satisfy the protocol. Keep the previous valid telemetry values unchanged.
+                latest_telemetry.invalid_packets++;
+
+                ESP_LOGW(
+                    TAG,
+                    "Rejected telemetry: reason=%s "
+                    "invalid=%lu line=%s",
+                    telemetry_parse_result_to_string(parse_result),
+                    (unsigned long)latest_telemetry.invalid_packets,
+                    line_buffer
+                );
+            }
+
+            // Reset the line accumulator for the next packet.
+            line_pos = 0;
+            line_buffer[0] = '\0';
+        }
+        else if (rx_byte == '\r') {
+            // Ignore carriage returns so both LF and CRLF senders work.
+            continue;
+        }
+        else {
+            if (line_pos < UART_LINE_BUFFER_SIZE - 1) {
+                line_buffer[line_pos++] = (char)rx_byte;
+            } else {
+                // The packet exceeded the configured maximum line length. 
+                // Drop the current buffer and count it as invalid.
+                // The remaining bytes are ignored until a newline arrives.
+                // A dedicated discard-until-newline state will be added in the next framing-hardening step.
+                latest_telemetry.invalid_packets++;
+
+                ESP_LOGW(
+                    TAG,
+                    "UART telemetry line exceeded %d bytes. "
+                    "Dropping buffer. invalid=%lu",
+                    UART_LINE_BUFFER_SIZE - 1,
+                    (unsigned long)latest_telemetry.invalid_packets
+                );
 
                 line_pos = 0;
-            }
-            else if (rx_byte != '\r') {
-                if (line_pos < UART_LINE_BUFFER_SIZE - 1) {
-                    line_buffer[line_pos++] = (char)rx_byte;
-                } else {
-                    ESP_LOGW(TAG, "UART line too long. Dropping buffer.");
-                    line_pos = 0;
-                }
+                line_buffer[0] = '\0';
             }
         }
     }
