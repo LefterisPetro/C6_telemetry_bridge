@@ -1,0 +1,9 @@
+# Use the full physical flash capacity of the ESP32-C6 board.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Use the large single-application partition layout.
+# OTA updates are intentionally not enabled at this development stage.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# ESP-IDF partition-table file associated with the large single-app layout.
+CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp_large.csv"
